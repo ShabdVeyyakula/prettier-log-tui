@@ -352,22 +352,22 @@ class StatusBar(Static):
 
 class PrettierApp(App):
     CSS = """
-    Screen { background: $surface; }
+    Screen { background: transparent; }
     StatusBar {
-        dock: top; height: 1; background: #1a2233; color: #9ab;
+        dock: top; height: 1; background: transparent; color: #9ab;
         padding: 0 1;
     }
-    #log { scrollbar-size-vertical: 1; }
-    .entry { padding: 0 1; }
-    .entry.selected { background: #26304a; }
+    #log { scrollbar-size-vertical: 1; background: transparent; }
+    .entry { padding: 0 1; background: transparent; }
+    .entry.selected { background: white 12%; }
     .entry.lvl-error { border-left: thick red; }
     .entry.lvl-warn { border-left: thick yellow; }
     #search {
         dock: top; height: 1; border: none; padding: 0 1;
-        background: #141b2b; color: #cde;
+        background: transparent; color: #cde;
     }
-    #search:focus { background: #1e2a44; }
-    #help { dock: bottom; height: 1; background: #1a2233; color: #667; padding: 0 1; }
+    #search:focus { background: white 8%; }
+    #help { dock: bottom; height: 1; background: transparent; color: #667; padding: 0 1; }
     """
 
     BINDINGS = [
