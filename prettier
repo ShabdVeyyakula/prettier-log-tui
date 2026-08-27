@@ -1,0 +1,763 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["textual>=1.0"]
+# ///
+"""prettier — wrap any command and render its log stream as a live, pretty TUI.
+
+Usage:
+    prettier uv run python -m app.temporal.worker
+    prettier -- some-command --with --flags
+
+Keys inside the TUI:
+    up/down or j/k   select entry
+    enter / click    cycle: collapsed -> tables -> full (untruncated)
+    x                jump straight to full view
+    c                collapse all
+    f                toggle follow (auto-scroll)
+    /                filter entries (esc to clear)
+    g / G            top / bottom
+    ctrl+c           send SIGINT to the child process
+    q                quit (terminates child if still running)
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import fcntl
+import json
+import os
+import pty
+import re
+import shlex
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import threading
+from dataclasses import dataclass, field
+
+from rich import box
+from rich.console import Group
+from rich.table import Table
+from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.containers import VerticalScroll
+from textual.widgets import Input, Static
+
+# ---------------------------------------------------------------- parsing
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]")
+TS_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\s*[-|]?\s*(?P<rest>.*)$"
+)
+LEVEL_RE = re.compile(r"\b(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL|FATAL|TRACE)\b")
+
+LEVEL_STYLE = {
+    "DEBUG": "dim",
+    "TRACE": "dim",
+    "INFO": "bold #4fa8ff",
+    "WARN": "bold yellow",
+    "WARNING": "bold yellow",
+    "ERROR": "bold red",
+    "CRITICAL": "bold white on red",
+    "FATAL": "bold white on red",
+    "": "dim",
+}
+
+
+def repair_truncated_json(s: str):
+    """Best-effort parse of a JSON blob whose tail was cut off by the logger.
+
+    Closes any open string, trims dangling keys back to the last complete
+    value, and appends the missing closing brackets.
+    """
+    if not s or s[0] not in "{[":
+        return None
+    closer = {"{": "}", "[": "]"}
+    stack: list[str] = []
+    cuts: list[tuple[int, str]] = []  # (cut index, closing suffix valid there)
+    in_str = esc = False
+    for i, ch in enumerate(s):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(closer[ch])
+            cuts.append((i + 1, "".join(reversed(stack))))
+        elif ch in "}]":
+            if not stack or stack[-1] != ch:
+                return None  # malformed, not merely truncated
+            stack.pop()
+            if not stack:
+                return None  # blob is complete; raw_decode should have handled it
+            cuts.append((i + 1, "".join(reversed(stack))))
+        elif ch == ",":
+            cuts.append((i, "".join(reversed(stack))))
+    if not stack:
+        return None
+    candidates = [(len(s), ('"' if in_str else "") + "".join(reversed(stack)))]
+    candidates += list(reversed(cuts[-40:]))
+    for i, suffix in candidates:
+        try:
+            obj = json.loads(s[:i] + suffix)
+        except ValueError:
+            continue
+        if obj:  # an empty {} / [] means the repair salvaged nothing
+            return obj
+    return None
+
+
+def extract_json(msg: str):
+    """Split a message into (head_text, [payloads], truncated) by pulling out embedded JSON."""
+    dec = json.JSONDecoder()
+    payloads: list = []
+    head_parts: list[str] = []
+    pos = 0
+    last = 0
+    misses = 0
+    truncated = False
+    while misses < 40:
+        candidates = [j for j in (msg.find("{", pos), msg.find("[", pos)) if j != -1]
+        if not candidates:
+            break
+        j = min(candidates)
+        obj = None
+        end = j + 1
+        try:
+            obj, end = dec.raw_decode(msg, j)
+        except ValueError:
+            # fallback: python-repr dicts like {'a': 1} at end of line
+            try:
+                obj = ast.literal_eval(msg[j:])
+                end = len(msg)
+            except (ValueError, SyntaxError, MemoryError, RecursionError):
+                # fallback: the logger cut the line mid-JSON — repair what's there
+                repaired = repair_truncated_json(msg[j:])
+                if isinstance(repaired, (dict, list)) and repaired:
+                    obj, end, truncated = repaired, len(msg), True
+        if isinstance(obj, (dict, list)) and obj:
+            head_parts.append(msg[last:j])
+            payloads.append(obj)
+            pos = last = end
+        else:
+            pos = j + 1
+            misses += 1
+    if not payloads:
+        return msg, [], truncated
+    head = "".join(head_parts) + msg[last:]
+    return head, payloads, truncated
+
+
+@dataclass
+class Entry:
+    ts: str
+    level: str
+    head: str
+    payloads: list
+    raw: str
+    truncated: bool = False
+    extra_lines: list[str] = field(default_factory=list)
+
+    @property
+    def search_blob(self) -> str:
+        return (self.raw + "\n" + "\n".join(self.extra_lines)).lower()
+
+
+def to_12h(ts: str) -> str:
+    """'2026-07-07 18:08:36,582' -> '6:08:36 PM' (log times are already local/PST)."""
+    if len(ts) < 19:
+        return ts
+    try:
+        hh = int(ts[11:13])
+    except ValueError:
+        return ts[11:19]
+    h12 = hh % 12 or 12
+    return f"{h12}:{ts[14:19]} {'AM' if hh < 12 else 'PM'}"
+
+
+def parse_line(line: str) -> Entry | None:
+    line = ANSI_RE.sub("", line).rstrip()
+    if not line.strip():
+        return None
+    m = TS_RE.match(line)
+    if m:
+        ts = m.group("ts")
+        rest = m.group("rest")
+        ts_short = to_12h(ts)
+    else:
+        ts_short = ""
+        rest = line
+    lm = LEVEL_RE.search(rest[:60])
+    level = lm.group(1) if lm else ""
+    if lm:
+        rest = (rest[: lm.start()] + rest[lm.end():]).strip(" -|:") or rest
+    head, payloads, truncated = extract_json(rest)
+    head = " ".join(head.split())
+    entry = Entry(ts=ts_short, level=level, head=head, payloads=payloads, raw=line,
+                  truncated=truncated)
+    entry.is_continuation = not m and not level  # type: ignore[attr-defined]
+    return entry
+
+
+# ---------------------------------------------------------------- rendering
+
+MAX_SCALAR = 200
+MAX_ROWS = 15
+MAX_COLS = 8
+MAX_DEPTH = 5
+
+
+def scalar_text(v, full: bool) -> Text:
+    if v is None:
+        return Text("null", style="dim italic")
+    if isinstance(v, bool):
+        return Text(str(v).lower(), style="magenta")
+    if isinstance(v, (int, float)):
+        return Text(str(v), style="cyan")
+    s = str(v).replace("\r\n", "\n").replace("\r", "\n")
+    if not full and len(s) > MAX_SCALAR:
+        t = Text(s[:MAX_SCALAR])
+        t.append(f" …(+{len(s) - MAX_SCALAR} chars, x=full)", style="dim italic")
+        return t
+    return Text(s)
+
+
+def render_obj(v, full: bool, depth: int = 0):
+    if depth > MAX_DEPTH:
+        return scalar_text(json.dumps(v, ensure_ascii=False), full)
+    if isinstance(v, dict):
+        t = Table(
+            show_header=False, box=box.ROUNDED, border_style="grey37",
+            pad_edge=False, expand=False,
+        )
+        t.add_column("k", style="bold #6fb3ff", no_wrap=True, overflow="ellipsis", max_width=32)
+        t.add_column("v", overflow="fold")
+        for k, val in v.items():
+            t.add_row(str(k), render_obj(val, full, depth + 1))
+        return t
+    if isinstance(v, list):
+        if v and all(isinstance(x, dict) for x in v):
+            keys: list[str] = []
+            for x in v:
+                for k in x:
+                    if k not in keys:
+                        keys.append(k)
+            shown_keys = keys if full else keys[:MAX_COLS]
+            t = Table(box=box.ROUNDED, border_style="grey37", header_style="bold #6fb3ff")
+            for k in shown_keys:
+                t.add_column(str(k), overflow="fold")
+            rows = v if full else v[:MAX_ROWS]
+            for x in rows:
+                t.add_row(*[render_obj(x.get(k), full, depth + 1) if k in x else Text("—", style="dim")
+                            for k in shown_keys])
+            notes = []
+            if len(v) > len(rows):
+                notes.append(f"+{len(v) - len(rows)} more rows")
+            if len(keys) > len(shown_keys):
+                notes.append(f"+{len(keys) - len(shown_keys)} more columns")
+            if notes:
+                t.caption = ", ".join(notes) + " (x=full)"
+                t.caption_style = "dim italic"
+            return t
+        if all(not isinstance(x, (dict, list)) for x in v):
+            return scalar_text(", ".join(str(x) for x in v), full)
+        return Group(*[render_obj(x, full, depth + 1) for x in (v if full else v[:MAX_ROWS])])
+    return scalar_text(v, full)
+
+
+def payload_hint(payloads: list) -> str:
+    parts = []
+    for p in payloads:
+        if isinstance(p, dict):
+            keys = list(p)
+            shown = ", ".join(keys[:3]) + ("…" if len(keys) > 3 else "")
+            parts.append("{" + shown + "}")
+        else:
+            parts.append(f"[{len(p)} items]")
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------- widgets
+
+class EntryWidget(Static):
+    """One log entry. mode: 0=collapsed, 1=tables (truncated), 2=full."""
+
+    def __init__(self, entry: Entry) -> None:
+        super().__init__()
+        self.entry = entry
+        self.mode = 0
+        self.add_class("entry")
+        lvl = entry.level or ""
+        if lvl in ("ERROR", "CRITICAL", "FATAL"):
+            self.add_class("lvl-error")
+        elif lvl in ("WARN", "WARNING"):
+            self.add_class("lvl-warn")
+        self.refresh_view()
+
+    def refresh_view(self) -> None:
+        e = self.entry
+        marker = "▾" if self.mode else "▸"
+        summary = Text(no_wrap=(self.mode == 0), overflow="ellipsis")
+        summary.append(f"{marker} ", style="dim")
+        summary.append(f"{(e.ts or ''):<11} ", style="green")
+        summary.append(f"{(e.level or '·'):<8}", style=LEVEL_STYLE.get(e.level, ""))
+        summary.append(e.head if e.head else "(no message)")
+        if e.payloads and self.mode == 0:
+            summary.append("  " + payload_hint(e.payloads), style="dim yellow")
+        if e.truncated:
+            summary.append(" ⚠", style="yellow")
+        if self.mode == 0:
+            self.update(summary)
+            return
+        blocks: list = [summary]
+        for p in e.payloads:
+            blocks.append(render_obj(p, full=True))
+        if e.truncated:
+            blocks.append(Text(
+                "⚠ this log line was cut off by the logger — JSON repaired, trailing fields missing",
+                style="yellow italic",
+            ))
+        if e.extra_lines:
+            blocks.append(Text("\n".join(e.extra_lines), style="dim"))
+        self.update(Group(*blocks))
+
+    def set_mode(self, mode: int) -> None:
+        if mode != self.mode:
+            self.mode = mode
+            self.refresh_view()
+
+    def toggle(self) -> None:
+        self.set_mode(0 if self.mode else 2)
+
+    def on_click(self) -> None:
+        self.app.select_widget(self)  # type: ignore[attr-defined]
+        self.toggle()
+
+
+class StatusBar(Static):
+    pass
+
+
+# ---------------------------------------------------------------- app
+
+class PrettierApp(App):
+    CSS = """
+    Screen { background: $surface; }
+    StatusBar {
+        dock: top; height: 1; background: #1a2233; color: #9ab;
+        padding: 0 1;
+    }
+    #log { scrollbar-size-vertical: 1; }
+    .entry { padding: 0 1; }
+    .entry.selected { background: #26304a; }
+    .entry.lvl-error { border-left: thick red; }
+    .entry.lvl-warn { border-left: thick yellow; }
+    #search {
+        dock: top; height: 1; border: none; padding: 0 1;
+        background: #141b2b; color: #cde;
+    }
+    #search:focus { background: #1e2a44; }
+    #help { dock: bottom; height: 1; background: #1a2233; color: #667; padding: 0 1; }
+    """
+
+    BINDINGS = [
+        ("q", "quit_app", "quit"),
+        ("enter", "toggle", "expand"),
+        ("x", "toggle", "expand"),
+        ("y", "copy_entry", "copy"),
+        ("c", "collapse_all", "collapse all"),
+        ("f", "toggle_follow", "follow"),
+        ("slash", "search", "filter"),
+        ("escape", "clear_search", ""),
+        ("up,k", "cursor(-1)", ""),
+        ("down,j", "cursor(1)", ""),
+        ("g", "go_top", ""),
+        ("G,end", "go_bottom", ""),
+        ("ctrl+c", "sigint", "SIGINT child"),
+    ]
+
+    MAX_ENTRIES = 3000
+
+    def __init__(self, argv: list[str], raw_path: str) -> None:
+        super().__init__()
+        self.argv = argv
+        self.raw_path = raw_path
+        self.follow = True
+        self.sel: int = -1
+        self.entries: list[EntryWidget] = []
+        self.filter_text = ""
+        self._queue: list[str] = []
+        self._qlock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+        self._exit_code: int | None = None
+        self._line_count = 0
+
+    # ---- layout
+
+    def compose(self) -> ComposeResult:
+        yield StatusBar(id="status")
+        yield Input(placeholder="🔍 filter logs — type a phrase, esc to clear ( / to focus)", id="search")
+        yield VerticalScroll(id="log")
+        yield Static(
+            "↑↓ select · enter expand · y copy · c collapse · f follow · / search bar · ctrl+c SIGINT · q quit",
+            id="help",
+        )
+
+    def on_mount(self) -> None:
+        self._start_child()
+        self.set_interval(0.08, self._flush)
+        self._update_status()
+        # keep initial focus off the search bar so j/k/enter/q drive the log view
+        self.call_after_refresh(self.set_focus, None)
+
+    # ---- child process on a pty
+
+    def _start_child(self) -> None:
+        master, slave = pty.openpty()
+        try:
+            cols, rows = os.get_terminal_size()
+        except OSError:
+            cols, rows = 200, 50
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, max(cols, 200), 0, 0))
+        env = dict(os.environ, PYTHONUNBUFFERED="1", TERM="dumb")
+        # prettier itself runs via `uv run --script`, which points VIRTUAL_ENV at the
+        # script's own env; scrub it so a child `uv run` uses the project's .venv
+        for var in ("VIRTUAL_ENV", "VIRTUAL_ENV_PROMPT", "UV_INTERNAL__PARENT_INTERPRETER"):
+            env.pop(var, None)
+        try:
+            self._proc = subprocess.Popen(
+                self.argv, stdin=slave, stdout=slave, stderr=slave,
+                close_fds=True, start_new_session=True, env=env,
+            )
+        except FileNotFoundError as exc:
+            os.close(master)
+            os.close(slave)
+            with self._qlock:
+                self._queue.append(f"ERROR - prettier: cannot launch: {exc}")
+            self._exit_code = 127
+            return
+        os.close(slave)
+        threading.Thread(target=self._reader, args=(master,), daemon=True).start()
+        threading.Thread(target=self._waiter, daemon=True).start()
+
+    def _reader(self, master: int) -> None:
+        buf = b""
+        raw_f = open(self.raw_path, "ab")
+        try:
+            while True:
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                raw_f.write(chunk)
+                buf += chunk
+                *lines, buf = buf.replace(b"\r\n", b"\n").replace(b"\r", b"\n").split(b"\n")
+                if lines:
+                    decoded = [ln.decode("utf-8", "replace") for ln in lines]
+                    with self._qlock:
+                        self._queue.extend(decoded)
+        finally:
+            raw_f.close()
+            if buf.strip():
+                with self._qlock:
+                    self._queue.append(buf.decode("utf-8", "replace"))
+            try:
+                os.close(master)
+            except OSError:
+                pass
+
+    def _waiter(self) -> None:
+        if self._proc is None:
+            return
+        code = self._proc.wait()
+        self._exit_code = code
+        self.call_from_thread(self._update_status)
+
+    # ---- ingest
+
+    def _flush(self) -> None:
+        with self._qlock:
+            if not self._queue:
+                return
+            lines, self._queue = self._queue, []
+        log = self.query_one("#log", VerticalScroll)
+        new_widgets: list[EntryWidget] = []
+        for line in lines:
+            entry = parse_line(line)
+            if entry is None:
+                continue
+            self._line_count += 1
+            # bare continuation lines (tracebacks etc.) attach to the previous entry
+            if getattr(entry, "is_continuation", False) and not entry.payloads and (
+                new_widgets or self.entries
+            ):
+                target = (new_widgets[-1] if new_widgets else self.entries[-1]).entry
+                target.extra_lines.append(entry.raw)
+                w = new_widgets[-1] if new_widgets else self.entries[-1]
+                if w.mode:
+                    w.refresh_view()
+                continue
+            new_widgets.append(EntryWidget(entry))
+        if new_widgets:
+            if self.filter_text:
+                for w in new_widgets:
+                    w.display = self.filter_text in w.entry.search_blob
+            log.mount_all(new_widgets)
+            self.entries.extend(new_widgets)
+            overflow = len(self.entries) - self.MAX_ENTRIES
+            if overflow > 0:
+                for w in self.entries[:overflow]:
+                    w.remove()
+                self.entries = self.entries[overflow:]
+                self.sel = max(-1, self.sel - overflow)
+            if self.follow:
+                self._select(len(self.entries) - 1, scroll=False)
+                log.scroll_end(animate=False)
+        self._update_status()
+
+    # ---- selection
+
+    def _select(self, idx: int, scroll: bool = True) -> None:
+        if not self.entries:
+            return
+        idx = max(0, min(idx, len(self.entries) - 1))
+        if 0 <= self.sel < len(self.entries):
+            self.entries[self.sel].remove_class("selected")
+        self.sel = idx
+        w = self.entries[idx]
+        w.add_class("selected")
+        if scroll:
+            w.scroll_visible(animate=False)
+
+    def select_widget(self, w: EntryWidget) -> None:
+        try:
+            self._select(self.entries.index(w))
+        except ValueError:
+            pass
+
+    # ---- actions
+
+    def action_cursor(self, delta: int) -> None:
+        if delta < 0:
+            self.follow = False
+        self._select((self.sel if self.sel >= 0 else len(self.entries)) + delta)
+        if self.sel == len(self.entries) - 1 and delta > 0:
+            self.follow = True
+        self._update_status()
+
+    def action_toggle(self) -> None:
+        if 0 <= self.sel < len(self.entries):
+            w = self.entries[self.sel]
+            w.toggle()
+            w.scroll_visible(animate=False)
+
+    def action_copy_entry(self) -> None:
+        if not (0 <= self.sel < len(self.entries)):
+            return
+        e = self.entries[self.sel].entry
+        if e.payloads:
+            parts = [f"{e.ts} {e.level} {e.head}".strip()]
+            parts += [json.dumps(p, indent=2, ensure_ascii=False) for p in e.payloads]
+        else:
+            parts = [e.raw]
+        if e.extra_lines:
+            parts.append("\n".join(e.extra_lines))
+        text = "\n".join(parts)
+        try:
+            subprocess.run(["pbcopy"], input=text.encode(), check=True)
+            self.notify(f"copied {len(text):,} chars to clipboard", timeout=2)
+        except (OSError, subprocess.CalledProcessError):
+            self.copy_to_clipboard(text)
+            self.notify(f"copied {len(text):,} chars (terminal clipboard)", timeout=2)
+
+    def action_collapse_all(self) -> None:
+        for w in self.entries:
+            w.set_mode(0)
+
+    def action_toggle_follow(self) -> None:
+        self.follow = not self.follow
+        if self.follow:
+            self.query_one("#log", VerticalScroll).scroll_end(animate=False)
+            self._select(len(self.entries) - 1, scroll=False)
+        self._update_status()
+
+    def action_go_top(self) -> None:
+        self.follow = False
+        self._select(0)
+        self._update_status()
+
+    def action_go_bottom(self) -> None:
+        self.follow = True
+        self._select(len(self.entries) - 1)
+        self.query_one("#log", VerticalScroll).scroll_end(animate=False)
+        self._update_status()
+
+    def action_search(self) -> None:
+        self.query_one("#search", Input).focus()
+
+    def action_clear_search(self) -> None:
+        inp = self.query_one("#search", Input)
+        inp.value = ""
+        self.filter_text = ""
+        for w in self.entries:
+            w.display = True
+        self.set_focus(None)
+        self._update_status()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        self.filter_text = event.value.lower().strip()
+        for w in self.entries:
+            w.display = (not self.filter_text) or self.filter_text in w.entry.search_blob
+        self._update_status()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.set_focus(None)
+
+    def action_sigint(self) -> None:
+        if self._proc and self._exit_code is None:
+            try:
+                os.killpg(self._proc.pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+
+    def action_quit_app(self) -> None:
+        self._kill_child()
+        self.exit()
+
+    def _kill_child(self) -> None:
+        if self._proc and self._exit_code is None:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(self._proc.pid, sig)
+                except ProcessLookupError:
+                    return
+                try:
+                    self._proc.wait(timeout=2)
+                    return
+                except subprocess.TimeoutExpired:
+                    continue
+
+    # ---- status
+
+    def _update_status(self) -> None:
+        cmd = shlex.join(self.argv)
+        if len(cmd) > 60:
+            cmd = cmd[:57] + "…"
+        if self._exit_code is None:
+            state = f"[#7fd77f]running[/] pid {self._proc.pid if self._proc else '?'}"
+        elif self._exit_code == 0:
+            state = "[#7fd77f]exited 0[/]"
+        else:
+            state = f"[red]exited {self._exit_code}[/]"
+        follow = "[#7fd77f]on[/]" if self.follow else "[yellow]off[/]"
+        filt = f" · filter: [yellow]{self.filter_text}[/]" if self.filter_text else ""
+        self.query_one("#status", StatusBar).update(
+            f"[bold #6fb3ff]prettier[/] · {cmd} · {state} · {self._line_count} lines"
+            f" · follow {follow}{filt} · raw → {self.raw_path}"
+        )
+
+
+# ---------------------------------------------------------------- main
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="prettier", add_help=True,
+        description="Run a command and render its logs as a live pretty TUI.",
+    )
+    parser.add_argument("--selftest", action="store_true", help="run parser self-tests and exit")
+    parser.add_argument("command", nargs=argparse.REMAINDER, help="command to run")
+    args = parser.parse_args()
+
+    if args.selftest:
+        _selftest()
+        return
+
+    argv = args.command
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    if not argv:
+        parser.error("no command given, e.g.: prettier uv run python -m app.temporal.worker")
+
+    raw_dir = os.path.expanduser("~/.cache/prettier")
+    os.makedirs(raw_dir, exist_ok=True)
+    import datetime
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    raw_path = os.path.join(raw_dir, f"{stamp}.log")
+
+    app = PrettierApp(argv, raw_path)
+    try:
+        app.run()
+    finally:
+        app._kill_child()
+        print(f"raw log saved to {raw_path}")
+
+
+def _selftest() -> None:
+    line = ('2026-07-07 18:08:54,005 - INFO - sdk_chat_summary user=dde6 '
+            '{"latency_ms": 2639, "model": "claude-haiku-4-5", "structured_output": '
+            '{"notify": false, "reason": "x"}}')
+    e = parse_line(line)
+    assert e is not None
+    assert e.ts == "6:08:54 PM", e.ts
+    assert to_12h("2026-07-07 00:05:01,000") == "12:05:01 AM"
+    assert to_12h("2026-07-07 12:00:00,000") == "12:00:00 PM"
+    assert to_12h("2026-07-07 09:30:00,000") == "9:30:00 AM"
+    assert e.level == "INFO", e.level
+    assert e.payloads and e.payloads[0]["latency_ms"] == 2639
+    assert "sdk_chat_summary" in e.head
+
+    line2 = ("2026-07-07 18:08:36,582 - INFO - Monitor 09b3 triage-dropped "
+             '(source=gmail, reason=blah): {"data": {"attachment_list": [{"a": 1}, {"a": 2}], '
+             '"id": "19f3"}}')
+    e2 = parse_line(line2)
+    assert e2 is not None and e2.payloads[0]["data"]["id"] == "19f3"
+    assert "triage-dropped" in e2.head
+
+    # logger-truncated json gets repaired into one payload, flagged
+    e3 = parse_line(
+        '2026-07-08 09:48:23,111 - INFO - Monitor 8d6773d5 triage-dropped (source=calendar_event): '
+        '{"data": {"attendees": [{"display_name": null, "email": "veyyakulashabd@gmail.com", '
+        '"response_status": "accepted"}], "calendar_id": "primary", "conference_data": '
+        '{"conferenceId": "upj-oett-hwb"}, "organizer_email": "veyyakulagaurav@gmail.com", "organizer_name'
+    )
+    assert e3 is not None and e3.truncated, "expected repaired truncated payload"
+    assert len(e3.payloads) == 1, e3.payloads
+    d = e3.payloads[0]["data"]
+    assert d["calendar_id"] == "primary"
+    assert d["attendees"][0]["email"] == "veyyakulashabd@gmail.com"
+    assert d["conference_data"]["conferenceId"] == "upj-oett-hwb"
+    assert "organizer_name" not in d  # dangling key trimmed
+    assert e3.head.strip().endswith("(source=calendar_event):"), e3.head
+
+    # truncated mid-string also repairs
+    e3b = parse_line('2026-07-07 18:08:36,582 - INFO - x: {"data": {"html_link": "https://www.googl')
+    assert e3b is not None and e3b.truncated and e3b.payloads[0]["data"]["html_link"].startswith("https")
+
+    # hopeless fragment neither parses nor crashes
+    assert repair_truncated_json("{'gcal', 'inbox'") is None
+
+    # continuation line
+    e4 = parse_line("    at some.traceback.line")
+    assert e4 is not None and getattr(e4, "is_continuation", False)
+
+    # rendering doesn't crash
+    render_obj(e2.payloads[0], full=False)
+    render_obj(e2.payloads[0], full=True)
+    render_obj([{"a": i, "b": "x" * 300} for i in range(30)], full=False)
+    print("selftest OK")
+
+
+if __name__ == "__main__":
+    main()
