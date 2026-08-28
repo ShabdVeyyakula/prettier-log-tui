@@ -16,6 +16,7 @@ Keys inside the TUI:
     c                collapse all
     f                toggle follow (auto-scroll)
     /                filter entries (esc to clear)
+    a                ask an AI assistant about the visible logs (needs OPENAI_API_KEY)
     g / G            top / bottom
     ctrl+c           send SIGINT to the child process
     q                quit (terminates child if still running)
@@ -37,10 +38,14 @@ import subprocess
 import sys
 import termios
 import threading
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 
 from rich import box
 from rich.console import Group
+from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -64,8 +69,60 @@ LEVEL_STYLE = {
     "ERROR": "bold red",
     "CRITICAL": "bold white on red",
     "FATAL": "bold white on red",
+    "AI": "bold #d783ff",
     "": "dim",
 }
+
+# ---------------------------------------------------------------- AI assistant
+
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+MAX_CONTEXT_LINES = 200
+MAX_CONTEXT_CHARS = 12000
+
+ASSISTANT_SYSTEM_PROMPT = (
+    "You are a terse log-analysis assistant embedded in a terminal log viewer called "
+    "`prettier`. You are shown a slice of recently streamed, already-parsed application "
+    "log lines (timestamps are 12-hour local time; embedded JSON may have been truncated "
+    "by the source logger, in which case it's marked with an incomplete-data warning). "
+    "Answer the user's question about these logs concisely and cite specific timestamps "
+    "or fields when relevant. Do not invent log lines or fields that are not present in "
+    "the provided context; say so if the context doesn't contain the answer."
+)
+
+
+def call_openai(question: str, context: str, model: str = DEFAULT_MODEL) -> str:
+    """Send a question plus a slice of log context to the OpenAI chat completions API."""
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set — export it and restart prettier.")
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": ASSISTANT_SYSTEM_PROMPT},
+            {"role": "user", "content": f"LOG CONTEXT:\n{context}\n\nQUESTION: {question}"},
+        ],
+        "temperature": 0.2,
+    }
+    req = urllib.request.Request(
+        OPENAI_API_URL,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        try:
+            detail = json.loads(detail)["error"]["message"]
+        except (ValueError, KeyError, TypeError):
+            pass
+        raise RuntimeError(f"OpenAI API error {exc.code}: {detail}") from None
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"network error contacting OpenAI: {exc.reason}") from None
+    return body["choices"][0]["message"]["content"]
 
 
 def repair_truncated_json(s: str):
@@ -302,6 +359,8 @@ class EntryWidget(Static):
             self.add_class("lvl-error")
         elif lvl in ("WARN", "WARNING"):
             self.add_class("lvl-warn")
+        elif lvl == "AI":
+            self.add_class("lvl-ai")
         self.refresh_view()
 
     def refresh_view(self) -> None:
@@ -328,7 +387,10 @@ class EntryWidget(Static):
                 style="yellow italic",
             ))
         if e.extra_lines:
-            blocks.append(Text("\n".join(e.extra_lines), style="dim"))
+            if e.level == "AI":
+                blocks.append(Markdown("\n".join(e.extra_lines)))
+            else:
+                blocks.append(Text("\n".join(e.extra_lines), style="dim"))
         self.update(Group(*blocks))
 
     def set_mode(self, mode: int) -> None:
@@ -362,11 +424,17 @@ class PrettierApp(App):
     .entry.selected { background: white 12%; }
     .entry.lvl-error { border-left: thick red; }
     .entry.lvl-warn { border-left: thick yellow; }
+    .entry.lvl-ai { border-left: thick #d783ff; }
     #search {
         dock: top; height: 1; border: none; padding: 0 1;
         background: transparent; color: #cde;
     }
     #search:focus { background: white 8%; }
+    #ask {
+        dock: bottom; height: 1; border: none; padding: 0 1;
+        background: white 8%; color: #cde; display: none;
+    }
+    #ask.visible { display: block; }
     #help { dock: bottom; height: 1; background: transparent; color: #667; padding: 0 1; }
     """
 
@@ -378,7 +446,8 @@ class PrettierApp(App):
         ("c", "collapse_all", "collapse all"),
         ("f", "toggle_follow", "follow"),
         ("slash", "search", "filter"),
-        ("escape", "clear_search", ""),
+        ("a", "ask", "ask AI"),
+        ("escape", "dismiss_bar", ""),
         ("up,k", "cursor(-1)", ""),
         ("down,j", "cursor(1)", ""),
         ("g", "go_top", ""),
@@ -408,8 +477,9 @@ class PrettierApp(App):
         yield StatusBar(id="status")
         yield Input(placeholder="🔍 filter logs — type a phrase, esc to clear ( / to focus)", id="search")
         yield VerticalScroll(id="log")
+        yield Input(placeholder="🤖 ask AI about these logs — enter to send, esc to cancel", id="ask")
         yield Static(
-            "↑↓ select · enter expand · y copy · c collapse · f follow · / search bar · ctrl+c SIGINT · q quit",
+            "↑↓ select · enter expand · y copy · c collapse · f follow · / search · a ask AI · ctrl+c SIGINT · q quit",
             id="help",
         )
 
@@ -607,7 +677,13 @@ class PrettierApp(App):
     def action_search(self) -> None:
         self.query_one("#search", Input).focus()
 
-    def action_clear_search(self) -> None:
+    def action_dismiss_bar(self) -> None:
+        ask = self.query_one("#ask", Input)
+        if ask.has_class("visible"):
+            ask.value = ""
+            ask.remove_class("visible")
+            self.set_focus(None)
+            return
         inp = self.query_one("#search", Input)
         inp.value = ""
         self.filter_text = ""
@@ -617,13 +693,66 @@ class PrettierApp(App):
         self._update_status()
 
     def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "search":
+            return
         self.filter_text = event.value.lower().strip()
         for w in self.entries:
             w.display = (not self.filter_text) or self.filter_text in w.entry.search_blob
         self._update_status()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "ask":
+            question = event.value.strip()
+            event.input.value = ""
+            event.input.remove_class("visible")
+            self.set_focus(None)
+            if question:
+                self._ask_ai(question)
+            return
         self.set_focus(None)
+
+    # ---- AI assistant
+
+    def action_ask(self) -> None:
+        ask = self.query_one("#ask", Input)
+        ask.add_class("visible")
+        ask.focus()
+
+    def _gather_context(self) -> str:
+        lines = [w.entry.raw for w in self.entries if w.display and w.entry.level != "AI"]
+        tail = lines[-MAX_CONTEXT_LINES:]
+        text = "\n".join(tail)
+        if len(text) > MAX_CONTEXT_CHARS:
+            text = f"[...older lines omitted...]\n{text[-MAX_CONTEXT_CHARS:]}"
+        return text
+
+    def _ask_ai(self, question: str) -> None:
+        context = self._gather_context()
+        ts = time.strftime("%I:%M:%S %p").lstrip("0")
+        entry = Entry(ts=ts, level="AI", head=question, payloads=[],
+                      raw=f"AI ask: {question}", extra_lines=["_thinking…_"])
+        widget = EntryWidget(entry)
+        widget.set_mode(2)
+        log = self.query_one("#log", VerticalScroll)
+        log.mount(widget)
+        self.entries.append(widget)
+        self._select(len(self.entries) - 1)
+        if self.follow:
+            log.scroll_end(animate=False)
+        threading.Thread(target=self._run_ai_query, args=(widget, question, context), daemon=True).start()
+
+    def _run_ai_query(self, widget: EntryWidget, question: str, context: str) -> None:
+        try:
+            answer = call_openai(question, context)
+        except Exception as exc:  # network/API errors surface inline rather than crashing the app
+            answer = f"**Error:** {exc}"
+
+        def update() -> None:
+            widget.entry.extra_lines = [answer]
+            if widget.mode:
+                widget.refresh_view()
+
+        self.call_from_thread(update)
 
     def action_sigint(self) -> None:
         if self._proc and self._exit_code is None:
@@ -756,6 +885,18 @@ def _selftest() -> None:
     render_obj(e2.payloads[0], full=False)
     render_obj(e2.payloads[0], full=True)
     render_obj([{"a": i, "b": "x" * 300} for i in range(30)], full=False)
+
+    # AI assistant: never makes a real network call when no key is configured
+    saved_key = os.environ.pop("OPENAI_API_KEY", None)
+    try:
+        call_openai("q", "ctx")
+        raise AssertionError("expected RuntimeError when OPENAI_API_KEY is unset")
+    except RuntimeError as exc:
+        assert "OPENAI_API_KEY" in str(exc), exc
+    finally:
+        if saved_key is not None:
+            os.environ["OPENAI_API_KEY"] = saved_key
+
     print("selftest OK")
 
 
