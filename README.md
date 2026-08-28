@@ -28,6 +28,14 @@ squinting at a wall of raw JSON.
   `~/.cache/prettier/<timestamp>.log`.
 - Tracebacks and other bare continuation lines attach to the entry above
   them instead of becoming noise.
+- **Built-in AI assistant** — press `a`, ask a question in plain English
+  ("any errors in the last few minutes?", "why did this monitor drop that
+  message?"), and it sends the currently visible log lines to the OpenAI
+  API and streams the answer back inline as a normal, expandable,
+  searchable, copyable entry. Requires `OPENAI_API_KEY` to be set in your
+  environment; optionally set `OPENAI_MODEL` (defaults to `gpt-4o-mini`).
+  Only the log lines currently visible (respecting an active search
+  filter) are sent, capped at the last 200 lines / ~12k characters.
 
 ## Keys
 
@@ -39,7 +47,8 @@ squinting at a wall of raw JSON.
 | `c` | collapse all |
 | `f` | toggle follow (auto-scroll) |
 | `/` | focus the search bar |
-| `esc` | clear search |
+| `a` | ask the AI assistant about the visible logs |
+| `esc` | clear search / cancel the ask bar |
 | `g` / `G` | jump to top / bottom |
 | `ctrl+c` | send SIGINT to the wrapped process |
 | `q` | quit (terminates the child if still running) |
